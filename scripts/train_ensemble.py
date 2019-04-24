@@ -14,111 +14,216 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import torch.nn.functional as F
 from sklearn.metrics import f1_score, accuracy_score
 import logging
+import sys
+import valid
 
+# PREDICT AT USER LEVEL
 
+#            submodels.append(CNN(f2i, ml, emb, fr, fc, kw, do))
 class CNN(torch.nn.Module):
-    def __init__(self, 
+    def __init__(self,
+                 feat_to_id,
+                 max_length,
+                 embeddings,
+                 freeze_embeddings,
                  filter_count, 
-                 char_kernel_widths, 
-                 word_kernel_widths, 
-                 max_char_length, 
-                 max_word_length,
-                 char_to_id,
-                 word_to_id,
-                 label_to_id, 
+                 kernel_widths, 
                  dropout_prob, 
-                 character_embeddings,
-                 word_embeddings,
-                 freeze_character_embeddings,
-                 freeze_word_embeddings,
+                 output_size,
              ):
         super(CNN, self).__init__()
 
         # set a bunch of dimensions and such
         self._filter_count = filter_count
-        self._char_kernel_widths = [c for c in char_kernel_widths if c > 0]
-        self._word_kernel_widths = [w for w in word_kernel_widths if w > 0]
-        self._max_char_length = max_char_length
-        self._max_word_length = max_word_length
-        self._nchars = len(char_to_id)
-        self._nwords = len(word_to_id)
-        self._nlabels = len(label_to_id)
+        self._kernel_widths = [c for c in kernel_widths]
+        self._max_length = max_char_length
+        self._nfeats = len(feat_to_id)
         self._dropout_prob = dropout_prob
-
-        # either initialize uninformed word embeddings of the given size, or read them in
+        self._output_size = output_size
+        
+        # either initialize uninformed embeddings of the given size, or read them in
         # from a pretrained embedding model
         try:
-            self._word_embedding_size = int(word_embeddings)
-            self._word_embeddings = torch.nn.Embedding(num_embeddings=self._nwords,
-                                                       embedding_dim=self._word_embedding_size,
-                                                       padding_idx=0)
+            self._embedding_size = int(embeddings)
+            self._embeddings = torch.nn.Embedding(num_embeddings=self._nfeats,
+                                                  embedding_dim=self._embedding_size,
+                                                  padding_idx=0)
         except:
-            embs = FastText.load_fasttext_format(word_embeddings)
-            self._word_embedding_size = embs.vector_size
-            emb_matrix = numpy.zeros(shape=(self._nwords, self._word_embedding_size))
+            embs = FastText.load_fasttext_format(embeddings)
+            self._embedding_size = embs.vector_size
+            emb_matrix = numpy.zeros(shape=(self._nfeats, self._embedding_size))
             found = 0
-            for w, i in word_to_id.items():
-                if w in embs.wv:
+            for f, i in feat_to_id.items():
+                if f in embs.wv:
                     found += 1
                 emb_matrix[i, :] = embs.wv[w]                    
-            self._word_embeddings = torch.nn.Embedding.from_pretrained(torch.Tensor(emb_matrix), freeze=freeze_word_embeddings)
-            logging.info("Pretrained word embeddings covered %d/%d (%f) of the vocab", found, self._nwords, found / self._nwords)
+            self._embeddings = torch.nn.Embedding.from_pretrained(torch.Tensor(emb_matrix), freeze=freeze_embeddings)
+            logging.info("Pretrained embeddings covered %d/%d (%f) of the vocab", found, self._nfeats, found / self._nfeats)
 
-        # either initialize uninformed character embeddings of the given size, or read them in
-        # from a pretrained embedding model
-        try:
-            self._char_embedding_size = int(character_embeddings)
-            self._char_embeddings = torch.nn.Embedding(num_embeddings=self._nchars,
-                                                       embedding_dim=self._char_embedding_size,
-                                                       padding_idx=0)
-        except:
-            embs = FastText.load_fasttext_format(char_embeddings)
-            self._char_embedding_size = embs.vector_size
-            emb_matrix = numpy.zeros(shape=(self._nchars, self._char_embedding_size))
-            found = 0
-            for w, i in char_to_id.items():
-                if w in embs.wv:
-                    found += 1
-                emb_matrix[i, :] = embs.wv[w]
-            self._char_embeddings = torch.nn.Embedding.from_pretrained(torch.Tensor(emb_matrix), freeze=freeze_character_embeddings)
-            logging.info("Pretrained character embeddings covered %d/%d (%f) of the vocab", found, self._nchars, found / self._nchars)
-
-        # character convolutions of each specified size and number of filters
-        self.char_convs = torch.nn.ModuleList([torch.nn.Conv1d(1, self._filter_count, (k, self._char_embedding_size)) for k in self._char_kernel_widths])
-
-        # word convolutions of each specified size and number of filters
-        self.word_convs = torch.nn.ModuleList([torch.nn.Conv1d(1, self._filter_count, (k, self._word_embedding_size)) for k in self._word_kernel_widths])
+        # convolutions of each specified size and number of filters
+        self.convs = torch.nn.ModuleList([torch.nn.Conv1d(1, self._filter_count, (k, self._embedding_size)) for k in self._kernel_widths])
 
         # dropout layer of specified probability
         self.dropout = torch.nn.Dropout(self._dropout_prob)
 
         # final fully-connected linear layer over the outputs from all the convolutions
-        self.output = torch.nn.Linear(len(self._char_kernel_widths + self._word_kernel_widths) * filter_count, 
-                                      self._nlabels)
+        self.output = torch.nn.Linear(len(self._kernel_widths) * self._filter_count, 
+                                      self._output_size)
 
-    def forward(self, cx, wx):
+    @property
+    def out_size(self):
+        return self._output_size
+        
+    def forward(self, x):
         # go from sequences of characters/words to corresponding sequences of embeddings
-        cx = self._char_embeddings(cx)
-        wx = self._word_embeddings(wx)
+        x = self._embeddings(x)
 
         # add a unary dimension, corresponding to the convolutions having a single
         # "input channel" (the embeddings)
-        cx = cx.unsqueeze(1)  # (N, Ci, W, D)
-        wx = wx.unsqueeze(1)
+        x = x.unsqueeze(1)  # (N, Ci, W, D)
 
         # apply the convolutions and max pooling
-        cx = [F.relu(conv(cx)).squeeze(3) for conv in self.char_convs]
-        cx = [F.max_pool1d(i, i.size(2)).squeeze(2) for i in cx]
-        wx = [F.relu(conv(wx)).squeeze(3) for conv in self.word_convs]
-        wx = [F.max_pool1d(i, i.size(2)).squeeze(2) for i in wx]
-        cx = [torch.cat(cx, 1)] if len(cx) > 0 else []
-        wx = [torch.cat(wx, 1)] if len(wx) > 0 else []
-        x = torch.cat(cx + wx, 1)
+        x = [F.relu(conv(x)).squeeze(3) for conv in self.convs]
+        x = [F.max_pool1d(i, i.size(2)).squeeze(2) for i in x]
+        x = [torch.cat(x, 1)] if len(x) > 0 else []
+        x = torch.cat(x, 1)
         x = self.dropout(x)
-        logit = self.output(x)
-        return torch.nn.functional.log_softmax(logit, dim=1)
-        
+        return self.output(x)
 
+
+class RNN(torch.nn.Module):
+    def __init__(self, 
+                 feat_to_id,
+                 max_length, 
+                 embeddings,
+                 freeze_embeddings,
+                 dropout_prob,
+                 output_size,
+             ):
+        super(RNN, self).__init__()
+
+        # set a bunch of dimensions and such
+        self._max_length = max_char_length
+        self._nfeats = len(feat_to_id)
+        self._dropout_prob = dropout_prob
+        self._hidden_size = output_size
+        
+        # either initialize uninformed embeddings of the given size, or read them in
+        # from a pretrained embedding model
+        try:
+            self._embedding_size = int(embeddings)
+            self._embeddings = torch.nn.Embedding(num_embeddings=self._nfeats,
+                                                  embedding_dim=self._embedding_size,
+                                                  padding_idx=0)
+        except:
+            embs = FastText.load_fasttext_format(embeddings)
+            self._embedding_size = embs.vector_size
+            emb_matrix = numpy.zeros(shape=(self._nfeats, self._embedding_size))
+            found = 0
+            for f, i in feat_to_id.items():
+                if f in embs.wv:
+                    found += 1
+                emb_matrix[i, :] = embs.wv[w]                    
+            self._embeddings = torch.nn.Embedding.from_pretrained(torch.Tensor(emb_matrix), freeze=freeze_embeddings)
+            logging.info("Pretrained embeddings covered %d/%d (%f) of the vocab", found, self._nfeats, found / self._nfeats)
+
+        self.rnn = torch.nn.GRU(input_size=self._embedding_size,
+                                     hidden_size=self._hidden_size,
+                                     num_layers=1,
+                                     batch_first=True,
+                                     dropout=self._dropout_prob,
+                                     bidirectional=False)
+
+        # dropout layer of specified probability
+        self.dropout = torch.nn.Dropout(self._dropout_prob)
+
+    @property
+    def out_size(self):
+        return self._hidden_size
+        
+    def forward(self, x):
+        # go from sequences of characters/words to corresponding sequences of embeddings
+        x = self._embeddings(x)
+        out, h = self.rnn(x)
+        return self.dropout(h.squeeze(0))
+
+
+class MLP(torch.nn.Module):
+    def __init__(self, 
+                 input_size,
+                 hidden_size_list,
+                 dropout_prob, 
+             ):
+        super(MLP, self).__init__()
+
+        # set a bunch of dimensions and such
+        self._size_list = [input_size] + hidden_size_list
+        self._dropout_prob = dropout_prob
+        
+        # dropout layer of specified probability
+        self.dropout = torch.nn.Dropout(self._dropout_prob)
+        self.layers = torch.nn.ModuleList()
+        for i in range(len(self._size_list) - 1):
+            self.layers.append(torch.nn.Linear(self._size_list[i], self._size_list[i + 1])) 
+            
+    def forward(self, x):
+        for i in range(len(self._size_list) - 1):
+            x = F.relu(self.layers[i](x))
+        return x
+
+    @property
+    def out_size(self):
+        return self._size_list[-1]
+
+    
+class Ensemble(torch.nn.Module):
+    def __init__(self,
+                 label_to_id,
+                 feats_to_ids,
+                 max_lengths,
+                 embeddings,
+                 freeze,
+                 
+                 filter_counts, 
+                 kernel_widths, 
+                 cnn_dropout_probs,
+                 cnn_output_sizes,
+
+                 rnn_hidden_sizes,
+                 rnn_dropout_probs,
+
+                 mlp_input_sizes,
+                 mlp_hidden_size_lists,
+                 mlp_dropout_probs,
+             ):
+        super(Ensemble, self).__init__()
+        self._output_size = len(label_to_id)
+        self.cnn_submodels = torch.nn.ModuleList()
+        for f2i, ml, emb, fr, fc, kw, do, out in zip(feats_to_ids, max_lengths, embeddings, freeze, filter_counts, kernel_widths, cnn_dropout_probs, cnn_output_sizes):
+            self.cnn_submodels.append(CNN(f2i, ml, emb, fr, fc, kw, do, out))
+        self.rnn_submodels = torch.nn.ModuleList()
+        for f2i, ml, emb, fr, do, hidden in zip(feats_to_ids, max_lengths, embeddings, freeze, rnn_dropout_probs, rnn_hidden_sizes):
+            self.rnn_submodels.append(RNN(f2i, ml, emb, fr, do, hidden))
+        self.mlp_submodels = torch.nn.ModuleList()
+        for i, hs, do in zip(mlp_input_sizes, mlp_hidden_size_lists, mlp_dropout_probs):
+            self.mlp_submodels.append(MLP(i, hs, do))
+        self._combined_size = sum([x.out_size for x in self.cnn_submodels] + [x.out_size for x in self.rnn_submodels] + [x.out_size for x in self.mlp_submodels])
+        print(self._combined_size)
+        self.linear = torch.nn.Linear(self._combined_size, self._output_size)
+
+        
+    def forward(self, sequence_data, mlp_data):
+        outputs = []
+        for submodel, data in zip(self.cnn_submodels, sequence_data):
+            outputs.append(submodel(data))
+        for submodel, data in zip(self.rnn_submodels, sequence_data):
+            outputs.append(submodel(data))
+        for submodel, data in zip(self.mlp_submodels, mlp_data):
+            outputs.append(submodel(data))
+        inp = torch.cat(outputs, 1)
+        return self.linear(inp)
+    
+        
 # simple dataset class, nothing really DID-specific...
 class DidData(Dataset):
     def __init__(self, items):
@@ -132,18 +237,24 @@ class DidData(Dataset):
 
 # callback for turning a list of (chars, words, label) triplets into
 # minibatch tensors, according to char, word, and label lookups
-def collate(clu, wlu, llu, max_char_length, max_word_length, gpu, triplets):
-    y = numpy.zeros(shape=(len(triplets), len(llu)))
-    for i, pair in enumerate(triplets):
-        y[i, llu[pair[2]]] = 1.0
-    wx = numpy.zeros(shape=(len(triplets), max_word_length))
-    cx = numpy.zeros(shape=(len(triplets), max_char_length))
-    for i, pair in enumerate(triplets):
-        chars = [clu.get(c, 1) for c in pair[0]][0:max_char_length]
+def collate(clu, wlu, llu, tlu, max_char_length, max_word_length, gpu, tuples):
+    y = numpy.zeros(shape=(len(tuples), len(llu)))
+    tl = numpy.zeros(shape=(len(tuples), len(tlu)))
+    sc = numpy.zeros(shape=(len(tuples), 26))
+    for i, (_, t, s, _, _, l) in enumerate(tuples):
+        y[i, llu[l]] = 1.0
+        tl[i, tlu[t]] = 1.0
+        sc[i, :] = s
+    wx = numpy.zeros(shape=(len(tuples), max_word_length))
+    cx = numpy.zeros(shape=(len(tuples), max_char_length))
+    for i, (_, _, _, _chars, _words, _) in enumerate(tuples):
+        chars = [clu.get(c, 1) for c in _chars][0:max_char_length]
         cx[i, 0:len(chars)] = chars
-        words = [wlu.get(c, 1) for c in pair[1]][0:max_word_length]
+        words = [wlu.get(c, 1) for c in _words][0:max_word_length]
         wx[i, 0:len(words)] = words
-    return [(x.cuda() if gpu else x) for x in [torch.LongTensor(cx), torch.LongTensor(wx), torch.Tensor(y)]]
+    
+    cx, wx, tl, sc, y = [(x.cuda() if gpu else x) for x in [torch.LongTensor(cx), torch.LongTensor(wx), torch.FloatTensor(tl), torch.FloatTensor(sc), torch.Tensor(y)]]
+    return ([cx, wx], [tl, sc], y)
     
         
 # Turn users into "A", retweet indicator into "B", and links into "C", otherwise removing non-Arabic/punc/ws
@@ -168,8 +279,8 @@ def evaluate(loader, model, loss_metric):
     total_loss = 0.0
     guesses = []
     gold = []
-    for i, (cx, wx, y) in enumerate(loader, 1):
-        out = model(cx, wx)
+    for i, (seq, mlp, y) in enumerate(loader, 1):
+        out = model(seq, mlp)
         loss = torch.mean(loss_metric(out, y))
         guesses.append([x.item() for x in out.argmax(1)])
         gold.append([x.item() for x in y.argmax(1)])
@@ -328,11 +439,13 @@ if __name__ == "__main__":
             word_seq = word_seq if not args.max_word_length else word_seq[:args.max_word_length]
             max_char_length = max(max_char_length, len(char_seq))
             max_word_length = max(max_word_length, len(word_seq))
-            train.append((char_seq, word_seq, label))
+            train.append((None, None, None, char_seq, word_seq, label))
         for line in ifd:
             try:
-                _, _, _, _, label, char_seq = line.strip().split("\t")
+                uid, _, tw, feats, label, char_seq = line.strip().split("\t")
+                feats = [float(x) for x in feats.split(",")]
             except:
+                uid, tw, feats = (None, None, None)
                 char_seq, label = line.strip().split("\t")
             if args.normalize:
                 char_seq = normalize_doc(char_seq)
@@ -343,7 +456,7 @@ if __name__ == "__main__":
             word_seq = word_seq if not args.max_word_length else word_seq[:args.max_word_length]
             max_char_length = max(max_char_length, len(char_seq))
             max_word_length = max(max_word_length, len(word_seq))
-            train.append((char_seq, word_seq, label))
+            train.append((uid, tw, feats, char_seq, word_seq, label))
 
     random.shuffle(train)
     train = train[0:len(train) if args.train_count == None else args.train_count]
@@ -352,13 +465,14 @@ if __name__ == "__main__":
     label_to_id = {} #"<UNK>" : 0}
     char_to_id = {"<PAD>" : 0, "<UNK>" : 1}
     word_to_id = {"<PAD>" : 0, "<UNK>" : 1}
-    for (cs, ws, l) in train:
+    tlang_to_id = {"<UNK>" : 0}
+    for (_, tw, _, cs, ws, l) in train:
         for c in cs:
             char_to_id[c] = char_to_id.get(c, len(char_to_id))
         for w in ws:
             word_to_id[w] = word_to_id.get(w, len(word_to_id))
         label_to_id[l] = label_to_id.get(l, len(label_to_id))
-
+        tlang_to_id[tw] = tlang_to_id.get(tw, len(tlang_to_id))
     
     with open(args.dev, "rt") as ifd:
         line = ifd.readline()
@@ -371,12 +485,14 @@ if __name__ == "__main__":
             word_seq = word_seq if not args.max_word_length else word_seq[:args.max_word_length]
             max_char_length = max(max_char_length, len(char_seq))
             max_word_length = max(max_word_length, len(word_seq))
-            dev.append((char_seq, word_seq, label))
+            dev.append((None, None, None, char_seq, word_seq, label))
         for line in ifd:
             try:
-                _, _, _, _, label, char_seq = line.strip().split("\t")
+                uid, _, tw, feats, label, char_seq = line.strip().split("\t")
+                feats = [float(x) for x in feats.split(",")]
             except:
                 char_seq, label = line.strip().split("\t")
+                uid, tw, feats = (None, None, None)
             if args.normalize:
                 char_seq = normalize_doc(char_seq)
             if char_seq == None:
@@ -386,18 +502,18 @@ if __name__ == "__main__":
             word_seq = word_seq if not args.max_word_length else word_seq[:args.max_word_length]
             max_char_length = max(max_char_length, len(char_seq))
             max_word_length = max(max_word_length, len(word_seq))
-            dev.append((char_seq, word_seq, label))
+            dev.append((uid, tw, feats, char_seq, word_seq, label))
 
     dev = dev[0:len(dev) if args.dev_count == None else args.dev_count]
 
-    for (cs, ws, l) in dev:
+    for (_, _, _, cs, ws, l) in dev:
         for c in cs:
             char_to_id[c] = char_to_id.get(c, len(char_to_id))
         for w in ws:
             word_to_id[w] = word_to_id.get(w, len(word_to_id))
         label_to_id[l] = label_to_id.get(l, len(label_to_id))
     id_to_label = {v : k for k, v in label_to_id.items()}
-
+    id_to_tlang = {v : k for k, v in tlang_to_id.items()}
 
     logging.info("Loaded %d train and %d dev instances, with %d features and %d labels, maximum character sequence length %d, maximum word sequence length %d", len(train), len(dev), len(char_to_id), len(label_to_id), max_char_length, max_word_length)
     
@@ -407,7 +523,8 @@ if __name__ == "__main__":
                               collate_fn=functools.partial(collate, 
                                                            char_to_id, 
                                                            word_to_id,
-                                                           label_to_id, 
+                                                           label_to_id,
+                                                           tlang_to_id,
                                                            max_char_length, 
                                                            max_word_length,
                                                            args.gpu))
@@ -415,28 +532,37 @@ if __name__ == "__main__":
                             batch_size=args.batch_size, 
                             shuffle=False,
                             collate_fn=functools.partial(collate, 
-                                                           char_to_id, 
-                                                           word_to_id,
-                                                           label_to_id, 
-                                                           max_char_length, 
-                                                           max_word_length,
-                                                           args.gpu))
+                                                         char_to_id, 
+                                                         word_to_id,
+                                                         label_to_id,
+                                                         tlang_to_id,
+                                                         max_char_length, 
+                                                         max_word_length,
+                                                         args.gpu))
 
-    model = CNN(args.filter_count, 
-                list(map(int, args.char_kernel_sizes.split(","))),
-                list(map(int, args.word_kernel_sizes.split(","))),
-                max_char_length, 
-                max_word_length, 
-                char_to_id, 
-                word_to_id,
-                label_to_id,
-                args.dropout,
-                args.character_embeddings,
-                args.word_embeddings,
-                args.freeze_character_embeddings,
-                args.freeze_word_embeddings,
+    model = Ensemble(label_to_id,
+                     [char_to_id, word_to_id],
+                     [max_char_length, max_word_length],
+                     [args.character_embeddings, args.word_embeddings],
+                     [args.freeze_character_embeddings, args.freeze_word_embeddings],
+                     
+                     # CNN
+                     [args.filter_count, args.filter_count],
+                     [list(map(int, args.char_kernel_sizes.split(","))), list(map(int, args.word_kernel_sizes.split(",")))],
+                     [args.dropout, args.dropout],
+                     [512, 512],
+
+                     # RNN
+                     [64, 64],
+                     [args.dropout, args.dropout],
+
+                     # MLP
+                     [len(tlang_to_id), 26],
+                     [[128, 32], [128, 32]],
+                     [args.dropout, args.dropout],
             )
-
+    #print(model)
+    
     # if GPU is to be used
     if args.gpu:
         model.cuda()
@@ -446,16 +572,15 @@ if __name__ == "__main__":
     metric = torch.nn.KLDivLoss(reduction="batchmean")
     optim = SGD(model.parameters(), lr=args.learning_rate, momentum=args.momentum)
     sched = ReduceLROnPlateau(optim, patience=args.patience, verbose=True)
-    
+    #sys.exit()
     best_dev_loss = None
     best_dev_out = None
     since_improvement = 0
     for epoch in range(1, args.epochs):
         loss_total = 0.0
-        for i, batch in enumerate(train_loader):
-            cx, wx, y = batch
+        for i, (seq, mlp, y) in enumerate(train_loader):
             model.zero_grad()            
-            out = model(cx, wx)
+            out = model(seq, mlp)
             loss = metric(out, y)
             loss = torch.mean(loss)
             optim.zero_grad()
