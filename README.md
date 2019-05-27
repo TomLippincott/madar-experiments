@@ -1,5 +1,7 @@
 # MADAR Arabic dialect experiments
 
+**Please ping me (tom@cs.jhu.edu) if you would like to use this repository beyond it's current archival function, and I can clean it up for you!**
+
 Install dependencies:
 
 ```
