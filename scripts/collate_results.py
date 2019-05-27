@@ -1,6 +1,9 @@
 import argparse
 import os.path
 import re
+import gzip
+import pickle
+import numpy
 
 if __name__ == "__main__":
 
@@ -9,23 +12,17 @@ if __name__ == "__main__":
     parser.add_argument("-o", "--output", dest="output", help="Output file")
     args = parser.parse_args()
 
+    items = []
+    fields = set()
     for fname in args.inputs:
-        path, f = os.path.split(fname)
-        _, task = os.path.split(path)
-        f, _ = os.path.splitext(f)
-        f, _ = os.path.splitext(f)
-        args = f.split("-")
-        model, lr, mom, drop, bs, fc, pat, es, ce, we, cs, ws = args
-        with open(fname, "rt") as ifd:
-            text = ifd.read()
-            m = re.match(r".*Pretrained word embeddings covered (\d+)/(\d+) \((.*?)\) of the vocab.*", text, re.I|re.S)
-            if m:
-                cov = m.group(3)
-            else:
-                cov = "n/a"
-            for m in re.finditer(r"Dev loss/f1/accuracy = (.*?)/(.*?)/(.*?)(\s|$)", text):
-                acc = m.group(2)
-                f1 = m.group(3)
-            
-        print("{}\t{}\t{}\t{}\t{}".format(fc, cs, ws, we, f1))
-
+        with gzip.open(fname, "rb") as ifd:
+            labels, score, conf = pickle.load(ifd)
+        config = {k : v for k, v in [x.split("=") for x in re.match(r"^(.*).pkl.gz$", os.path.basename(fname)).group(1).split("-")]}
+        items.append((config, score))
+        for k in config.keys():
+            fields.add(k)
+    fields = list(sorted(fields))
+    with gzip.open(args.output, "wt") as ofd:
+        ofd.write("\t".join(fields + ["F1"]) + "\n")
+        for item, score in items:
+            ofd.write("\t".join([item.get(f, "NA") for f in fields] + [str(score)]) + "\n")

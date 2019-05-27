@@ -93,6 +93,7 @@ class CNN(torch.nn.Module):
         self.dropout = torch.nn.Dropout(self._dropout_prob)
 
         # final fully-connected linear layer over the outputs from all the convolutions
+        print(len(self._char_kernel_widths + self._word_kernel_widths) * filter_count)
         self.output = torch.nn.Linear(len(self._char_kernel_widths + self._word_kernel_widths) * filter_count, 
                                       self._nlabels)
 
@@ -279,12 +280,12 @@ if __name__ == "__main__":
     parser.add_argument("--patience", 
                         dest="patience", 
                         type=int, 
-                        default=10, 
+                        #default=10, 
                         help="Number of epochs for patience in learning rate reduction")
     parser.add_argument("--early_stop", 
                         dest="early_stop", 
                         type=int, 
-                        default=20, 
+                        #default=20, 
                         help="Number of epochs for early stop")
     parser.add_argument("--epochs", 
                         dest="epochs", 
@@ -443,10 +444,15 @@ if __name__ == "__main__":
 
     # recursively initialize model weights
     model.apply(init_weights)
+    #print(model)
+    #for param in model.parameters():
+    #    print(type(param.data), param.size())
+    #sys.exit()
     metric = torch.nn.KLDivLoss(reduction="batchmean")
     optim = SGD(model.parameters(), lr=args.learning_rate, momentum=args.momentum)
     sched = ReduceLROnPlateau(optim, patience=args.patience, verbose=True)
-    
+
+
     best_dev_loss = None
     best_dev_out = None
     since_improvement = 0
@@ -472,7 +478,7 @@ if __name__ == "__main__":
             best_dev_out = dev_out
         else:
             since_improvement += 1
-            if since_improvement > args.early_stop:
+            if args.early_stop != None and since_improvement > args.early_stop:
                 logging.info("Stopping early after %d epochs with no improvement", args.early_stop)
                 break
                 
